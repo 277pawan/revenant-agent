@@ -96,12 +96,17 @@ export function buildDatabaseUrl(claimed: ClaimedPayload): string | null {
   }
   const user = encodeURIComponent(username);
   const pass = encodeURIComponent(claimed.password);
+  const dbName = encodeURIComponent(databaseName);
   const p = port ?? 5432;
-  const ssl =
-    sslMode && sslMode !== "disable"
-      ? `?sslmode=${encodeURIComponent(sslMode)}`
-      : "";
-  return `postgresql://${user}:${pass}@${host}:${p}/${databaseName}${ssl}`;
+  // Cloud stores sslMode (require | prefer | disable | verify-full…). Default require for remote hosts.
+  const mode =
+    !sslMode || sslMode === ""
+      ? host === "localhost" || host === "127.0.0.1"
+        ? "disable"
+        : "require"
+      : sslMode;
+  const ssl = mode === "disable" ? "" : `?sslmode=${encodeURIComponent(mode)}`;
+  return `postgresql://${user}:${pass}@${host}:${p}/${dbName}${ssl}`;
 }
 
 /** Rewrite cloud plan YAML into CLI-shaped config (connection via DATABASE_URL). */

@@ -1,37 +1,24 @@
-# Revenant Agent Box
+# revenant-agent
 
-Separate app from **Revenant Cloud**. This is the worker that runs on a customer machine (or CI).
-
-It is **not** an npm package you import into the website. It is a **Node service** you start once and leave running.
-
-```
-revenant-cloud      → API + control plane
-revenant-cloud-web → dashboard
-revenant-agent     → Agent Box (this repo)  ← executes jobs
-revenant-cli       → `revenant verify` engine (spawned by Agent Box)
-```
-
-## How it works
-
-1. Admin opens Cloud → **Settings → Agent Box** → Connect worker → copies token  
-2. On a server: put token in `agent.yaml` → `npm start`  
-3. Users in the website only click **Run**  
-4. Agent Box polls Cloud, claims the job, runs `revenant verify`, posts results  
-
-## Setup
+Local:
 
 ```bash
-cd revenant-agent
 cp agent.example.yaml agent.yaml
-# edit apiUrl + token from Settings
+# paste token from Settings → Validation services → Issue agent token
 npm install
-npm start
+REVENANT_RUNNER_TOKEN=rvn_... npm start
 ```
 
-Optional: set `cliPath` (or `REVENANT_CLI_PATH`) to your `revenant` binary.
+Docker (API URL is baked into the image at build time):
 
-## Later
+```bash
+docker run -d --restart unless-stopped \
+  -e REVENANT_RUNNER_TOKEN=rvn_... \
+  yourorg/revenant-agent:latest
+```
 
-- Publish as Docker image / binary so customers never need this source tree  
-- systemd unit for always-on install  
-- Optional public npm CLI: `npx revenant-agent` (same process, nicer packaging)
+Build image with your deployed API:
+
+```bash
+docker build --build-arg REVENANT_API_URL=https://api.yourdomain.com -t yourorg/revenant-agent .
+```
