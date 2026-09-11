@@ -1,0 +1,10 @@
+# Revenant Agent Box — paste values from Settings → Runners (token shown once).
+# Keep this file private. Do not commit real tokens.
+
+apiUrl: http://127.0.0.1:8080
+token: rvn_PASTE_TOKEN_FROM_SETTINGS
+kind: agent
+pollIntervalMs: 3000
+
+# Optional — path to revenant CLI for real verify (otherwise sibling binary / PATH)
+# cliPath: /home/you/Documents/revenant/revenant-cli/revenant
