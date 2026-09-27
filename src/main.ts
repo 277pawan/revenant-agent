@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { DEFAULT_API_URL } from "./api-url.js";
-import { resolveRevenantCli } from "./execute-job.js";
+import { isLocalCliOverrideAllowed, resolveRevenantCli } from "./execute-job.js";
 import { startRunnerPoll } from "./poll-loop.js";
 
 type AgentConfig = {
@@ -43,7 +43,14 @@ async function loadConfig(): Promise<AgentConfig & { apiUrl: string }> {
   const pollIntervalMs = Number(
     process.env.REVENANT_POLL_MS ?? fileCfg.pollIntervalMs ?? 3000
   );
-  const cliPath = process.env.REVENANT_CLI_PATH ?? fileCfg.cliPath;
+  if (!isLocalCliOverrideAllowed() && process.env.REVENANT_CLI_PATH) {
+    delete process.env.REVENANT_CLI_PATH;
+    console.warn("[agent] ignoring REVENANT_CLI_PATH because local fallback is disabled; using latest GitHub release");
+  }
+
+  const cliPath = isLocalCliOverrideAllowed()
+    ? (process.env.REVENANT_CLI_PATH ?? fileCfg.cliPath)
+    : undefined;
 
   if (!token) {
     console.error("Set REVENANT_RUNNER_TOKEN or token in agent.yaml");
