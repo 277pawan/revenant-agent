@@ -5,6 +5,7 @@ import {
   executeClaimedJob,
   type ClaimedPayload,
   type ExecutionOutcome,
+  type ReportRunnerProgress,
 } from "./execute-job.js";
 
 export type RunnerPollOptions = {
@@ -44,9 +45,41 @@ async function claimAndComplete(opts: RunnerPollOptions): Promise<void> {
     `[${opts.label ?? opts.executionMode}] claimed ${claimed.job.id} (${claimed.job.databaseName})`
   );
 
+  const reportProgress: ReportRunnerProgress = async (stage, message, checks) => {
+    try {
+      const response = await fetch(
+        `${opts.apiBase}/api/v1/runner/jobs/${claimed.job.id}/progress`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${opts.token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            stage,
+            message: message.slice(0, 255),
+            ...(checks ? { checks: checks.slice(-100) } : {}),
+          }),
+        }
+      );
+      if (!response.ok) {
+        console.error(
+          `[${opts.label ?? opts.executionMode}] progress update failed:`,
+          response.status,
+          await response.text()
+        );
+      }
+    } catch (error) {
+      console.error(
+        `[${opts.label ?? opts.executionMode}] progress update failed:`,
+        error instanceof Error ? error.message : error
+      );
+    }
+  };
   const outcome: ExecutionOutcome = await executeClaimedJob(
     claimed,
-    opts.executionMode
+    opts.executionMode,
+    reportProgress
   );
 
   const completeRes = await fetch(
