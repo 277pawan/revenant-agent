@@ -37,7 +37,7 @@ export type RunnerAwsCredentials = {
 export type ClaimedPayload = {
   job: { id: string; databaseName: string };
   database: {
-    engine: "postgres" | "mysql";
+    engine: "postgres" | "mysql" | "mongodb";
     host: string | null;
     port: number | null;
     databaseName: string | null;
@@ -46,6 +46,7 @@ export type ClaimedPayload = {
     recoveryMode?: RecoveryMode;
   };
   password: string | null;
+  connectionString?: string | null;
   recovery: AwsRecoveryConfig | null;
   awsCredentials: RunnerAwsCredentials | null;
   planYaml: string | null;
@@ -124,11 +125,6 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-export function isLocalCliOverrideAllowed(): boolean {
-  const value = (process.env.REVENANT_ALLOW_LOCAL_FALLBACK ?? "").trim().toLowerCase();
-  return value === "true" || value === "1" || value === "yes";
-}
-
 export function buildReleaseAssetName(version: string): string | null {
   const normalizedVersion = version.replace(/^v/, "");
   const platform = process.platform;
@@ -160,33 +156,56 @@ export function buildReleaseAssetName(version: string): string | null {
   return `revenant_${normalizedVersion}_${osName}_${archName}.${suffix}`;
 }
 
+export function buildGitHubReleaseHeaders(
+  accept: string,
+  token = process.env.REVENANT_CLI_GITHUB_TOKEN
+): Record<string, string> {
+  const normalizedToken = token?.trim();
+  return {
+    Accept: accept,
+    ...(normalizedToken ? { Authorization: `Bearer ${normalizedToken}` } : {}),
+  };
+}
+
 async function installLatestRevenantCli(): Promise<string | null> {
   const repo = process.env.REVENANT_CLI_REPO ?? "277pawan/revenant-cli";
   const targetDir = process.env.REVENANT_CLI_DIR ?? resolve(process.cwd(), ".revenant-bin");
-  const releaseVersion = process.env.REVENANT_CLI_VERSION ?? "latest";
-  const version = releaseVersion === "latest"
-    ? await fetch(`https://api.github.com/repos/${repo}/releases/latest`)
-        .then(async (res) => {
-          if (!res.ok) throw new Error(`github release lookup failed: ${res.status}`);
-          const json = (await res.json()) as { tag_name?: string };
-          if (!json.tag_name) throw new Error("latest release tag missing");
-          return json.tag_name;
-        })
-        .catch(() => null)
-    : releaseVersion;
-
-  if (!version) return null;
+  const token = process.env.REVENANT_CLI_GITHUB_TOKEN;
+  const releaseResponse = await fetch(
+    `https://api.github.com/repos/${repo}/releases/latest`,
+    {
+      headers: buildGitHubReleaseHeaders("application/vnd.github+json", token),
+      signal: AbortSignal.timeout(30_000),
+    }
+  );
+  if (!releaseResponse.ok) {
+    throw new Error(`github latest release lookup failed: ${releaseResponse.status}`);
+  }
+  const release = (await releaseResponse.json()) as {
+    tag_name?: string;
+    assets?: Array<{ id: number; name: string }>;
+  };
+  const version = release.tag_name;
+  if (!version) throw new Error("latest GitHub release tag missing");
+  console.log(`[revenant-resolver] selected GitHub release tag=${version}`);
 
   const assetName = buildReleaseAssetName(version);
   if (!assetName) return null;
+  const asset = release.assets?.find((candidate) => candidate.name === assetName);
+  if (!asset) {
+    throw new Error(`GitHub release ${version} is missing asset ${assetName}`);
+  }
 
   await mkdir(targetDir, { recursive: true });
   const installDir = targetDir;
   const archivePath = join(installDir, assetName);
-  const archiveUrl = `https://github.com/${repo}/releases/download/${version}/${assetName}`;
-  const archiveResponse = await fetch(archiveUrl);
+  const archiveUrl = `https://api.github.com/repos/${repo}/releases/assets/${asset.id}`;
+  const archiveResponse = await fetch(archiveUrl, {
+    headers: buildGitHubReleaseHeaders("application/octet-stream", token),
+    signal: AbortSignal.timeout(30_000),
+  });
   if (!archiveResponse.ok) {
-    return null;
+    throw new Error(`GitHub release asset download failed: ${archiveResponse.status}`);
   }
 
   const archiveBuffer = Buffer.from(await archiveResponse.arrayBuffer());
@@ -250,39 +269,23 @@ async function installLatestRevenantCli(): Promise<string | null> {
     child.on("close", (code) => (code === 0 ? resolvePromise() : reject(new Error(`chmod failed with code ${code}`))));
   });
 
-  process.env.REVENANT_CLI_PATH = finalBin;
   await rm(unpackDir, { recursive: true, force: true }).catch(() => undefined);
   return finalBin;
 }
 
-/** Resolve revenant binary: latest GitHub release by default, with explicit local opt-in only. */
+/** Always resolve the CLI binary from the latest published GitHub release. */
 export async function resolveRevenantCli(): Promise<string | null> {
-  const localFallbackAllowed = isLocalCliOverrideAllowed();
-  const fromEnv = process.env.REVENANT_CLI_PATH?.trim();
-
-  if (!localFallbackAllowed && fromEnv) {
-    delete process.env.REVENANT_CLI_PATH;
-    console.warn(
-      "[revenant-resolver] ignoring REVENANT_CLI_PATH because local fallback is disabled; using latest GitHub release only"
-    );
-  }
-
-  if (fromEnv && localFallbackAllowed && (await fileExists(fromEnv))) {
-    console.log(`[revenant-resolver] using REVENANT_CLI_PATH=${fromEnv}`);
-    return fromEnv;
-  }
-
   try {
     const installed = await installLatestRevenantCli();
     if (installed) {
-      console.log(`[revenant-resolver] using GitHub release binary=${installed}`);
+      console.log(`[revenant-resolver] using latest GitHub release binary=${installed}`);
       return installed;
     }
   } catch (error) {
     console.warn("[revenant-resolver] GitHub release lookup failed:", error);
   }
 
-  console.warn("[revenant-resolver] no release binary found; refusing local repo and PATH fallback");
+  console.warn("[revenant-resolver] no latest GitHub release binary available");
   return null;
 }
 
@@ -295,6 +298,7 @@ export function isAwsRecoveryMode(claimed: ClaimedPayload): boolean {
 
 export function buildDatabaseUrl(claimed: ClaimedPayload): string | null {
   const { engine, host, port, databaseName, username, sslMode } = claimed.database;
+  if (engine === "mongodb") return null;
   if (!host || !databaseName || !username || !claimed.password) {
     return null;
   }
@@ -339,8 +343,21 @@ function extractChecksBlock(planYaml: string | null): string {
 export function buildDirectCliConfigYaml(
   planYaml: string | null,
   planName: string,
-  engine: "postgres" | "mysql"
+  engine: "postgres" | "mysql" | "mongodb",
+  databaseName?: string | null
 ): string {
+  if (engine === "mongodb") {
+    return [
+      `plan: ${JSON.stringify(planName)}`,
+      "database:",
+      "  engine: mongodb",
+      "  connection: ${MONGODB_URI}",
+      ...(databaseName ? [`  name: ${JSON.stringify(databaseName)}`] : []),
+      "",
+      extractChecksBlock(planYaml),
+      "",
+    ].join("\n");
+  }
   return [
     `plan: ${JSON.stringify(planName)}`,
     "database:",
@@ -420,6 +437,7 @@ function runCommand(
       ? "checking_source"
       : "running_checks";
     const onLine = (line: string) => {
+      line = sanitizeCliOutput(line, opts.env);
       const normalized = line.toLowerCase();
       let nextStage = stage;
       if (normalized.includes("creating") && normalized.includes("snapshot")) {
@@ -448,7 +466,7 @@ function runCommand(
           checkName: message,
           checkType: "source_validation",
           status: marker === "✓" ? "pass" : "fail",
-          message,
+          message: sanitizeCliOutput(message, opts.env),
         });
       }
       if (opts.onProgress && (match || stageChanged)) {
@@ -485,12 +503,40 @@ function runCommand(
     child.on("close", (code) => {
       clearTimeout(timer);
       if (stdoutLine) onLine(stdoutLine);
-      void progressQueue.then(() => resolvePromise({ code, stdout, stderr }));
+      void progressQueue.then(() =>
+        resolvePromise({
+          code,
+          stdout: sanitizeCliOutput(stdout, opts.env),
+          stderr: sanitizeCliOutput(stderr, opts.env),
+        })
+      );
     });
   });
 }
 
-function mapCliReport(report: CliReport, checkType?: string): CheckResult[] {
+export function sanitizeCliOutput(value: string, env: NodeJS.ProcessEnv): string {
+  let sanitized = value;
+  for (const [key, secret] of Object.entries(env)) {
+    if (
+      secret &&
+      secret.length >= 4 &&
+      (key === "DATABASE_URL" ||
+        key === "MONGODB_URI" ||
+        /(PASSWORD|SECRET|TOKEN|ACCESS_KEY)/i.test(key))
+    ) {
+      sanitized = sanitized
+        .split(secret)
+        .join(key === "MONGODB_URI" ? "[REDACTED_MONGODB_URI]" : "[REDACTED]");
+    }
+  }
+  return sanitized
+    .replace(/mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi, "[REDACTED_MONGODB_URI]")
+    .replace(/(https?:\/\/[^:/\s@]+:)[^@\s/]+@/gi, "$1[REDACTED]@")
+    .replace(/((?:password|passwd|secret|token|authorization)\s*[=:]\s*)\S+/gi, "$1[REDACTED]")
+    .slice(0, 2000);
+}
+
+export function mapCliReport(report: CliReport, checkType?: string): CheckResult[] {
   const checks = report.checks ?? [];
   if (checks.length === 0) {
     return [
@@ -536,26 +582,35 @@ export function buildCliEnv(
   claimed: ClaimedPayload,
   awsMode: boolean
 ): { env: NodeJS.ProcessEnv; error?: string } {
+  const baseEnv = { ...process.env };
+  delete baseEnv.REVENANT_CLI_GITHUB_TOKEN;
+
   if (awsMode) {
     const { host, username, databaseName } = claimed.database;
     const recovery = claimed.recovery;
     const aws = claimed.awsCredentials;
 
+    if (claimed.database.engine === "mongodb") {
+      return {
+        env: baseEnv,
+        error: "MongoDB direct validation does not support AWS/RDS restore mode",
+      };
+    }
     if (!recovery?.sourceIdentifier || !recovery.region) {
       return {
-        env: process.env,
+        env: baseEnv,
         error: "AWS recovery config incomplete — set RDS instance ID and region",
       };
     }
     if (!aws?.accessKeyId || !aws.secretAccessKey) {
       return {
-        env: process.env,
+        env: baseEnv,
         error: "AWS credentials missing — add access keys on the database",
       };
     }
     if (!host || !username || !claimed.password || !databaseName) {
       return {
-        env: process.env,
+        env: baseEnv,
         error:
           "Source RDS host, master username, password, and database name are required",
       };
@@ -563,14 +618,14 @@ export function buildCliEnv(
     const databaseUrl = buildDatabaseUrl(claimed);
     if (!databaseUrl) {
       return {
-        env: process.env,
+        env: baseEnv,
         error: "Could not build a source database URL for the selected database engine",
       };
     }
 
     return {
       env: {
-        ...process.env,
+        ...baseEnv,
         AWS_ACCESS_KEY_ID: aws.accessKeyId,
         AWS_SECRET_ACCESS_KEY: aws.secretAccessKey,
         ...(aws.sessionToken ? { AWS_SESSION_TOKEN: aws.sessionToken } : {}),
@@ -584,17 +639,34 @@ export function buildCliEnv(
     };
   }
 
+  if (claimed.database.engine === "mongodb") {
+    const connectionString = claimed.connectionString?.trim();
+    if (
+      !connectionString ||
+      !/^mongodb(?:\+srv)?:\/\//i.test(connectionString) ||
+      !claimed.database.databaseName?.trim()
+    ) {
+      return {
+        env: baseEnv,
+        error: "MongoDB validation requires a MongoDB URI and database name",
+      };
+    }
+    return {
+      env: { ...baseEnv, MONGODB_URI: connectionString },
+    };
+  }
+
   const databaseUrl = buildDatabaseUrl(claimed);
   if (!databaseUrl) {
     return {
-      env: process.env,
+      env: baseEnv,
       error: "Missing host, database name, username, or password",
     };
   }
 
   return {
     env: {
-      ...process.env,
+      ...baseEnv,
       DATABASE_URL: databaseUrl,
     },
   };
@@ -634,7 +706,7 @@ async function runWithCli(
     claimed.planYaml,
     claimed.contractHealthcheck
   );
-  const yaml = awsMode && claimed.recovery
+  const yaml = awsMode && claimed.recovery && claimed.database.engine !== "mongodb"
     ? buildAwsCliConfigYaml(
         claimed.planYaml,
         planName,
@@ -645,8 +717,9 @@ async function runWithCli(
     : buildDirectCliConfigYaml(
         claimed.planYaml,
         planName,
-        claimed.database.engine
-      );
+      claimed.database.engine,
+      claimed.database.databaseName
+    );
 
   const dir = await mkdtemp(join(tmpdir(), "revenant-job-"));
   try {
@@ -674,7 +747,9 @@ async function runWithCli(
       const snapOk = snap.code === 0;
       let snapshotReport: CliReport = {};
       try {
-        snapshotReport = JSON.parse(await readFile(reportPath, "utf8")) as CliReport;
+        snapshotReport = JSON.parse(
+          sanitizeCliOutput(await readFile(reportPath, "utf8"), env)
+        ) as CliReport;
       } catch {
         snapshotReport = {};
       }
@@ -751,13 +826,24 @@ async function runWithCli(
 
     let report: CliReport = {};
     try {
-      report = JSON.parse(await readFile(reportPath, "utf8")) as CliReport;
+      report = JSON.parse(
+        sanitizeCliOutput(await readFile(reportPath, "utf8"), env)
+      ) as CliReport;
     } catch {
       report = {};
     }
 
-    const verifyResults = report.checks?.length ? mapCliReport(report) : [];
-    if (verifyResults.length === 0 && (stdout || stderr)) {
+    const verifyResults =
+      report.checks?.length || report.status ? mapCliReport(report) : [];
+    if (verifyResults.length === 0 && claimed.database.engine === "mongodb") {
+      verifyResults.push({
+        checkName: "verify",
+        checkType: "verify",
+        status: "fail",
+        message: "MongoDB CLI did not report any check results",
+        durationMs: Date.now() - started,
+      });
+    } else if (verifyResults.length === 0 && (stdout || stderr)) {
       verifyResults.push({
         checkName: "verify",
         checkType: "verify",
@@ -909,21 +995,64 @@ export async function executeClaimedJob(
   executionMode: "stub" | "agent" | "ci",
   reportProgress?: ReportRunnerProgress
 ): Promise<ExecutionOutcome> {
+  const mongodb = claimed.database.engine === "mongodb";
+  if (mongodb && isAwsRecoveryMode(claimed)) {
+    return mongoFailureOutcome(
+      executionMode,
+      "MongoDB direct validation does not support AWS/RDS restore mode"
+    );
+  }
+  if (mongodb) {
+    const { error } = buildCliEnv(claimed, false);
+    if (error) return mongoFailureOutcome(executionMode, error);
+  }
   const forceSim =
     process.env.REVENANT_FORCE_SIMULATE === "true" ||
     (executionMode === "stub" && process.env.REVENANT_STUB_SIMULATE === "true");
 
   if (forceSim) {
+    if (mongodb) {
+      return mongoFailureOutcome(
+        executionMode,
+        "MongoDB validation cannot be simulated; a real Revenant CLI run is required"
+      );
+    }
     return runMetadataFallback(claimed, executionMode, "forced simulation");
   }
 
   const cli = await resolveRevenantCli();
   if (!cli) {
+    if (mongodb) {
+      return mongoFailureOutcome(
+        executionMode,
+        "Revenant CLI unavailable; MongoDB checks were not run"
+      );
+    }
     return runMetadataFallback(
       claimed,
       executionMode,
       "revenant CLI not found — latest GitHub release could not be fetched, or local fallback is disabled"
     );
+  }
+
+  function mongoFailureOutcome(
+    executionMode: "stub" | "agent" | "ci",
+    message: string
+  ): ExecutionOutcome {
+    return {
+      status: "fail",
+      executionMode,
+      usedCli: false,
+      rtoSeconds: 1,
+      errorMessage: message,
+      results: [{
+        checkName: "connect",
+        checkType: "connect",
+        status: "fail",
+        message,
+        durationMs: 0,
+      }],
+    };
   }
 
   return runWithCli(

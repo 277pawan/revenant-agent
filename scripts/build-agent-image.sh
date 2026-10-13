@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Build agent image with Go CLI baked in (Phase 5.1).
+# Build the agent image; the agent downloads its CLI from GitHub at runtime.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CLI="$(cd "$ROOT/../revenant-cli" && pwd)"
 TAG="${1:-revenant-agent:local}"
 API_URL="${REVENANT_API_URL:-http://127.0.0.1:8080}"
 
@@ -14,17 +13,10 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -f "$CLI/go.mod" ]]; then
-  echo "Expected CLI at $CLI"
-  exit 1
-fi
-
-echo "CLI context: $CLI"
 echo "Tag:         $TAG"
 echo "API URL:     $API_URL"
 
 docker build \
-  --build-context cli-src="$CLI" \
   --build-arg REVENANT_API_URL="$API_URL" \
   -t "$TAG" \
   "$ROOT"

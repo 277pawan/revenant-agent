@@ -14,7 +14,6 @@ RUN apt-get update \
 ARG REVENANT_API_URL
 ENV REVENANT_API_URL=${REVENANT_API_URL}
 ENV NODE_ENV=production
-ENV REVENANT_ALLOW_LOCAL_FALLBACK=false
 
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev

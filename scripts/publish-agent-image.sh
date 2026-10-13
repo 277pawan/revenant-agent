@@ -7,7 +7,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CLI="$(cd "$ROOT/../revenant-cli" && pwd)"
 TAG="${1:-}"
 API_URL="${REVENANT_API_URL:-}"
 
@@ -31,7 +30,6 @@ echo "Baking API: $API_URL"
 echo "Tag:        $TAG"
 
 docker build \
-  --build-context cli-src="$CLI" \
   --build-arg REVENANT_API_URL="$API_URL" \
   -t "$TAG" \
   -t "${TAG%:*}:latest" \
